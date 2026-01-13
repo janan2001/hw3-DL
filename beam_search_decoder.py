@@ -46,110 +46,86 @@ class BeamSearchDecoder(nn.Module):
         self.beam_size = beam_size
 
     def forward(self, input_seq, input_length, max_length):
-        # Forward input through encoder model
         encoder_outputs, encoder_hidden = self.encoder(input_seq, input_length)
 
-        # Prepare encoder's final hidden layer to be first hidden input to the decoder
-        # encoder_hidden: (n_layers * num_directions, batch_size, hidden_size)
-        # decoder_hidden: (n_layers, batch_size, hidden_size)
-        decoder_hidden = encoder_hidden[:self.decoder.n_layers]
+        if encoder_hidden.size(0) == self.decoder.n_layers * 2:
+            decoder_hidden0 = encoder_hidden.view(self.decoder.n_layers, 2, 1, -1).sum(dim=1)
+        else:
+            decoder_hidden0 = encoder_hidden[:self.decoder.n_layers]
 
-        # Initialize the beam with the start sequence
-        # Each hypothesis is a tuple: (last_token, hidden_state, sequence, score)
-        # But for efficiency, we can keep track of sequences and scores separately
-
-        # We start with one hypothesis: [SOS], score=0
-        # For the loop, we track:
-        # - current_tokens: list of last tokens for each hypothesis (size k)
-        # - current_hidden: hidden states for each hypothesis (size k, n_layers, 1, hidden)
-        # - sequences: list of token lists
-        # - scores: list of cumulative log-probs
-
-        # Initial input
-        decoder_input = torch.ones(1, 1, device=self.device, dtype=torch.long) * self.SOS_token
-
-        # Initial set of beams
-        # sequence, score, hidden state
-        # sequence is a list of tensors
-        beams = [([], 0.0, decoder_hidden)]
+        # Initialize beams
+        # (tokens, hidden, total_logp, token_logps, finished)
+        beams_sen = [([], decoder_hidden0, 0.0, [], False)]
+        completed_sen = []
 
         for _ in range(max_length):
             new_beams = []
-
-            for seq, score, hidden in beams:
-                if len(seq) > 0 and seq[-1].item() == self.EOS_token:
-                    # If this beam already ended, keep it (don't expand)
-                    new_beams.append((seq, score, hidden))
-                    continue
-
-                # Prepare input for this beam
-                if len(seq) == 0:
-                    inp = torch.tensor([[self.SOS_token]], device=self.device, dtype=torch.long)
-                else:
-                    inp = seq[-1].view(1, 1)
-
-                # Forward pass
-                # inp: (1, 1)
-                # hidden: (n_layers, 1, hidden_size)
-                # encoder_outputs: (seq_len, 1, hidden_size) - need to expand this if we batched, but we loop here
-
-                decoder_output, next_hidden = self.decoder(inp, hidden, encoder_outputs)
-                # decoder_output: (1, vocab_size) - logits (since we removed Softmax in models.py)
-
-                # Apply Log Softmax to get log-probabilities
-                log_probs = F.log_softmax(decoder_output, dim=1)
-
-                # Get top k candidates
-                # If we are at the very beginning (just SOS), we pick top k from this one.
-                # If we have B beams, we might pick top k from each?
-                # Standard Beam Search:
-                # Expand all B current beams -> B * Vocab possibilities.
-                # Calculate new scores.
-                # Prune to top k best among ALL B * Vocab possibilities.
-
-                # Optimization: We usually just take top k from each to limit size, then prune global list.
-                top_scores, top_indices = torch.topk(log_probs, self.beam_size)
-
-                for i in range(self.beam_size):
-                    token = top_indices[0][i]
-                    token_score = top_scores[0][i].item()
-
-                    new_seq = seq + [token]
-                    new_score = score + token_score
-                    new_beams.append((new_seq, new_score, next_hidden))
-
-            # Sort all new beams by score (descending)
-            new_beams.sort(key=lambda x: x[1], reverse=True)
-
-            # Keep top k
-            beams = new_beams[:self.beam_size]
-
-            # Check if all top k are finished (optional optimization)
-            all_finished = True
-            for seq, _, _ in beams:
-                if len(seq) == 0 or seq[-1].item() != self.EOS_token:
-                    all_finished = False
-                    break
-            if all_finished:
+            if all(finished for (_, _, _, _, finished) in beams_sen):
                 break
 
-        # Return best sequence
-        best_seq, best_score, _ = beams[0]
+            # Expand each beam
+            for tokens, hidden, total_logp, token_logps, finished in beams_sen:
+                if finished:
+                    # already ended with EOS -> keep it without expanding
+                    new_beams.append((tokens, hidden, total_logp, token_logps, True))
+                    continue
 
-        # Convert list of tensors to single tensor
-        if len(best_seq) > 0:
-            all_tokens = torch.stack(best_seq)
-            # Scores: we only tracked cumulative. The prompt asks for "collections of word tokens and scores".
-            # Greedy decoder returns list of scores per token.
-            # Beam search usually maximizes total score.
-            # We can just return the total score or reconstruct per-token scores if needed.
-            # Given the Greedy signature `all_scores` (tensor), let's just return a tensor of the total score or similar.
-            # Or simplified: just return the tokens.
-            # The prompt says: "Return the best decoded token sequence (and optionally its scores)."
+                # Decoder input = last generated token, or SOS if none yet
+                if len(tokens) == 0:
+                    decoder_input = torch.tensor([[self.SOS_token]], device=self.device, dtype=torch.long)
+                else:
+                    decoder_input = torch.tensor([[tokens[-1]]], device=self.device, dtype=torch.long)
 
-            # Let's mock per-token scores as 0 for now or just return the cumulative scalar as a 1-element tensor?
-            # Greedy returns `all_scores` as vector of probs.
-            # We'll just return the best tokens.
-            return all_tokens, torch.tensor([best_score], device=self.device)
+                # One decoder step
+                decoder_output, next_hidden = self.decoder(decoder_input, hidden, encoder_outputs)
+
+                # Convert logits -> log-probs (Using F.log_softmax because model outputs logits)
+                log_probs = F.log_softmax(decoder_output, dim=1)  # (1, vocab_size), stable
+
+                # Take top-k next tokens for this beam
+                # Note: if we have B beams, expanding each by beam_size results in B*K candidates.
+                # The user's snippet expands each beam by K and then prunes to K total.
+                top_logp, top_idx = torch.topk(log_probs, self.beam_size, dim=1)
+
+                # Create new hypotheses from these k expansions
+                for j in range(self.beam_size):
+                    next_token = top_idx[0, j].item()      # predicted token id (int)
+                    next_logp = top_logp[0, j].item()      # log P(token | history, x)
+
+                    new_tokens = tokens + [next_token]     # append token to the sequence
+                    new_token_logps = token_logps + [next_logp]
+                    new_total = total_logp + next_logp     # accumulate log-prob sum
+                    new_finished = (next_token == self.EOS_token)
+
+                    hyp = (new_tokens, next_hidden, new_total, new_token_logps, new_finished)
+
+                    # If finished, store separately; otherwise keep for next step
+                    if new_finished:
+                        completed_sen.append(hyp)
+                    else:
+                        new_beams.append(hyp)
+
+            # Keep only the best k active beams (highest total log-prob)
+            if len(new_beams) > 0:
+                new_beams.sort(key=lambda x: x[2], reverse=True)
+                beams_sen = new_beams[:self.beam_size]
+            else:
+                # If everything finished this step, keep current beams as-is
+                break
+
+        # ---------------------------
+        # 5) Choose best final hypothesis
+        # Prefer completed if any; else best unfinished
+        # ---------------------------
+        if len(completed_sen) > 0:
+            completed_sen.sort(key=lambda x: x[2], reverse=True)
+            best_tokens, _, _, best_token_logps, _ = completed_sen[0]
         else:
-            return torch.tensor([], device=self.device), torch.tensor([0.0], device=self.device)
+            beams_sen.sort(key=lambda x: x[2], reverse=True)
+            best_tokens, _, _, best_token_logps, _ = beams_sen[0]
+
+        # Convert Python lists to tensors (like GreedySearchDecoder returns)
+        best_tokens_tensor = torch.tensor(best_tokens, device=self.device, dtype=torch.long)
+        best_scores_tensor = torch.tensor(best_token_logps, device=self.device, dtype=torch.float)
+
+        return best_tokens_tensor, best_scores_tensor
